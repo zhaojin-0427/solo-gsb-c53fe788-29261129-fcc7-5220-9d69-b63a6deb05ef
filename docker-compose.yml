@@ -1,0 +1,130 @@
+name: reliable-webhook
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-webhook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-webhook}
+      POSTGRES_DB: ${POSTGRES_DB:-webhooks}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webhook} -d ${POSTGRES_DB:-webhooks}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # S3 兼容对象存储：事件载荷以内容寻址的不可变对象保存在此。
+  # 控制台（浏览器）：http://localhost:9001  （默认凭据 minioadmin/minioadmin）
+  # S3 API：http://minio:9000（compose 网络内）/ http://localhost:9000（宿主机）
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "${S3_API_PORT:-9000}:9000"
+      - "${S3_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@db:5432/${POSTGRES_DB:-webhooks}
+      LEASE_SECONDS: ${LEASE_SECONDS:-30}
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-10}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-6}
+      BACKOFF_BASE_SECONDS: ${BACKOFF_BASE_SECONDS:-5}
+      BACKOFF_CAP_SECONDS: ${BACKOFF_CAP_SECONDS:-300}
+      # 出站安全策略：默认阻止回环/私网/链路本地/组播/云元数据地址；
+      # 显式放行 compose 网络内的 receiver 主机名（可用 .env 覆盖追加）
+      WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-receiver}
+      WEBHOOK_ALLOWED_CIDRS: ${WEBHOOK_ALLOWED_CIDRS:-}
+      WEBHOOK_MAX_REDIRECTS: ${WEBHOOK_MAX_REDIRECTS:-5}
+      # 订阅密钥信封加密的本地密钥环：默认挂载 ./deploy/dev-keyring.json（仅供
+      # 本地开发，生产必须更换）。若改用 WEBHOOK_KEYRING_JSON（非空时优先于文件），
+      # 在 .env 中设置即可，无需改动挂载。
+      WEBHOOK_KEYRING_JSON: ${WEBHOOK_KEYRING_JSON:-}
+      WEBHOOK_KEYRING_FILE: ${WEBHOOK_KEYRING_FILE:-/run/keyring/keyring.json}
+      # 事件载荷对象存储（S3 兼容，指向 compose 内的 MinIO；桶不存在自动创建）
+      PAYLOAD_STORE_MODE: ${PAYLOAD_STORE_MODE:-s3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-webhook-payloads}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      PAYLOAD_MAX_BYTES: ${PAYLOAD_MAX_BYTES:-1048576}
+      PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-3600}
+    volumes:
+      - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@db:5432/${POSTGRES_DB:-webhooks}
+      LEASE_SECONDS: ${LEASE_SECONDS:-30}
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-10}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-6}
+      BACKOFF_BASE_SECONDS: ${BACKOFF_BASE_SECONDS:-5}
+      BACKOFF_CAP_SECONDS: ${BACKOFF_CAP_SECONDS:-300}
+      # 与 api 使用同一策略配置：Worker 每次尝试重新解析并固定校验通过的地址
+      WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-receiver}
+      WEBHOOK_ALLOWED_CIDRS: ${WEBHOOK_ALLOWED_CIDRS:-}
+      WEBHOOK_MAX_REDIRECTS: ${WEBHOOK_MAX_REDIRECTS:-5}
+      # 与 api 使用同一密钥环：Worker 在签名前解包 DEK 解密订阅密钥
+      WEBHOOK_KEYRING_JSON: ${WEBHOOK_KEYRING_JSON:-}
+      WEBHOOK_KEYRING_FILE: ${WEBHOOK_KEYRING_FILE:-/run/keyring/keyring.json}
+      # 与 api 使用同一对象存储：Worker 取载荷、复核摘要后才签名
+      PAYLOAD_STORE_MODE: ${PAYLOAD_STORE_MODE:-s3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-webhook-payloads}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      PAYLOAD_MAX_BYTES: ${PAYLOAD_MAX_BYTES:-1048576}
+      PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-3600}
+    volumes:
+      - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  receiver:
+    build: .
+    command: ["uvicorn", "app.receiver:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      RECEIVER_SECRET: ${RECEIVER_SECRET:-dev-signing-secret}
+      RECEIVER_TIMESTAMP_TOLERANCE_SECONDS: ${RECEIVER_TIMESTAMP_TOLERANCE_SECONDS:-300}
+    ports:
+      - "${RECEIVER_PORT:-8001}:8001"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:
