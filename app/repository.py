@@ -44,6 +44,12 @@ VERSION_COLUMNS = """
     v.created_at, v.superseded_at, v.secret_key_id
 """
 
+# 订阅查询返回字段（paused/paused_at/resumed_at 展示暂停状态；不含密钥）
+SUB_COLUMNS = (
+    "id, source, target_url, active, paused, paused_at, resumed_at, "
+    "current_revision, created_at"
+)
+
 
 def delivery_to_dict(row: asyncpg.Record) -> dict[str, Any]:
     data = dict(row)
@@ -101,13 +107,12 @@ async def create_subscription(
     """
     async with conn.transaction():
         sub = await conn.fetchrow(
-            """
+            f"""
             INSERT INTO subscriptions (source, target_url, secret, current_revision)
             VALUES ($1, $2, '', 1)
             ON CONFLICT (source, target_url) DO UPDATE
                 SET active = TRUE
-            RETURNING id, source, target_url, active, created_at, current_revision,
-                      (xmax = 0) AS inserted
+            RETURNING {SUB_COLUMNS}, (xmax = 0) AS inserted
             """,
             source,
             target_url,
@@ -138,8 +143,8 @@ async def get_subscription_by_id(
     conn: asyncpg.Connection, subscription_id: int
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
-        """
-        SELECT id, source, target_url, active, current_revision, created_at
+        f"""
+        SELECT {SUB_COLUMNS}
         FROM subscriptions WHERE id = $1
         """,
         subscription_id,
@@ -150,8 +155,8 @@ async def find_subscription(
     conn: asyncpg.Connection, source: str, target_url: str
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
-        """
-        SELECT id, source, target_url, active, current_revision, created_at
+        f"""
+        SELECT {SUB_COLUMNS}
         FROM subscriptions WHERE source = $1 AND target_url = $2
         """,
         source,
@@ -164,20 +169,78 @@ async def list_subscriptions(
 ) -> list[asyncpg.Record]:
     if source is not None:
         rows = await conn.fetch(
-            """
-            SELECT id, source, target_url, active, current_revision, created_at
+            f"""
+            SELECT {SUB_COLUMNS}
             FROM subscriptions WHERE source = $1 ORDER BY id
             """,
             source,
         )
     else:
         rows = await conn.fetch(
-            """
-            SELECT id, source, target_url, active, current_revision, created_at
+            f"""
+            SELECT {SUB_COLUMNS}
             FROM subscriptions ORDER BY id
             """
         )
     return list(rows)
+
+
+# -- 订阅暂停 / 恢复 --------------------------------------------------------------
+#
+# 暂停状态写入与 Worker claim_delivery 认领提交的事务先后次序（关键不变式）：
+# - set_paused 与 claim_delivery 都在自己的事务内持有 subscriptions 行锁
+#   （FOR UPDATE），两者对同一订阅严格串行；
+# - 暂停事务先持锁提交：其更新对认领事务随后的同一行锁读可见，认领事务在
+#   提交前复核到 paused=TRUE 即放弃认领（整事务回滚，不产生租约）；
+# - 认领事务先持锁提交：租约已落库，暂停事务只能在其之后获得行锁，该已认领
+#   尝试继续执行并照常以租约栅栏结算（暂停不触碰 in_flight 投递）；
+# 因此“暂停响应成功”与“最后一条新租约产生”之间存在确定先后，不存在读到
+# 旧状态的认领越过暂停边界。暂停不改任何 deliveries 行（seq/not_before/
+# attempts_made 原样保留），恢复即沿原状态继续。
+
+async def set_subscription_paused(
+    conn: asyncpg.Connection, subscription_id: int, paused: bool
+) -> tuple[asyncpg.Record | None, bool]:
+    """幂等设置订阅暂停/恢复状态（单事务，行锁与认领事务互斥）。
+
+    返回 (订阅行, 状态是否发生变化)：
+    - 暂停：paused TRUE、paused_at=now()、resumed_at=NULL；已暂停则整操作
+      幂等（不刷新 paused_at，时间戳稳定）；
+    - 恢复：paused FALSE、resumed_at=now()（仅在本次确实从暂停恢复时写入，
+      重复恢复幂等不改写时间戳）、paused_at 保留为最近一次暂停时刻；
+    - 订阅不存在返回 (None, False)（调用方据此返回 404）。
+    """
+    async with conn.transaction():
+        if paused:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE subscriptions
+                SET paused = TRUE,
+                    paused_at = COALESCE(paused_at, now()),
+                    resumed_at = NULL
+                WHERE id = $1 AND paused = FALSE
+                RETURNING {SUB_COLUMNS}
+                """,
+                subscription_id,
+            )
+            if row is not None:
+                return row, True
+        else:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE subscriptions
+                SET paused = FALSE,
+                    resumed_at = now()
+                WHERE id = $1 AND paused = TRUE
+                RETURNING {SUB_COLUMNS}
+                """,
+                subscription_id,
+            )
+            if row is not None:
+                return row, True
+        # 已是目标状态（幂等）或订阅不存在：取当前行区分两种情况。
+        current = await get_subscription_by_id(conn, subscription_id)
+        return current, False
 
 
 # -- 订阅配置版本 / CAS 发布 ----------------------------------------------------
@@ -534,6 +597,10 @@ async def finalize_event_submission(
         )
 
         # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+        # 注意只过滤 active=TRUE：active=FALSE 是“停用身份”（不建投递），而
+        # paused=TRUE 的暂停订阅仍须照常建立 pending 投递并钉住当前配置版本
+        # （暂停只阻止 Worker 认领新租约，不能复用 active 标志阻止建投递），
+        # 恢复后这些投递按原 seq/退避/尝试次数继续。
         await conn.execute(
             """
             SELECT id FROM subscriptions
@@ -579,8 +646,95 @@ async def get_event(
 # 严格顺序的关键：
 # 1) 先在事务中锁定该订阅“可投递且 seq 最小”的那一条（FOR UPDATE SKIP LOCKED）；
 # 2) 检查它前面是否还有未终结的投递，有则跳过（保证前一事件成功或进死信后才动）；
-# 3) 用 lease_token 栅栏把它置为 in_flight，旧租约必须已过期才可接管。
+# 3) 锁定投递所属的 subscriptions 行并复核 paused/active——暂停状态的写入
+#    （set_subscription_paused）持同一把订阅行锁，二者在数据库层串行：暂停先
+#    提交则本次复核必见 paused=TRUE，放弃认领，绝不产生越过暂停边界的新租约；
+#    本次先提交则租约已落库，暂停只能随后生效，该尝试照常执行与结算；
+# 4) 用 lease_token 栅栏把它置为 in_flight，旧租约必须已过期才可接管。
 # 认领/重试/接管一律不改变 config_version_id：投递钉死在创建时的版本上。
+# 拆成三个可在同一事务内依次调用的原语（_claim_select_candidate /
+# _claim_lock_subscription / _claim_mark_in_flight），既供 claim_delivery 组合，
+# 也让“暂停写入 ↔ 认领提交”的行锁先后次序可被确定性地交错测试。
+async def _claim_select_candidate(
+    conn: asyncpg.Connection, now: datetime
+) -> asyncpg.Record | None:
+    """锁定并返回一个候选队首投递行（仅持有投递行锁，尚未提交租约）。"""
+    # 候选：每个订阅 seq 最小的可处理投递（pending 到点 或 租约过期的 in_flight）。
+    # NOT EXISTS 保证严格顺序：前面还有未终结投递时不允许发送后续事件。
+    # s.paused = FALSE 只是快速过滤（READ COMMITTED 语句快照可能读到旧状态）；
+    # 权威的暂停裁决在下一步锁定订阅行后的复核，防止读到旧状态的认领越过边界。
+    return await conn.fetchrow(
+        """
+        SELECT d.id, d.event_id_fk, d.subscription_id, d.status,
+               d.attempts_made, d.leased_by
+        FROM deliveries d
+        JOIN subscriptions s ON s.id = d.subscription_id
+        WHERE (
+                (d.status = 'pending' AND d.not_before <= $1)
+             OR (d.status = 'in_flight' AND d.lease_expires_at < $1)
+            )
+          AND s.active = TRUE
+          AND s.paused = FALSE
+          AND NOT EXISTS (
+                SELECT 1
+                FROM deliveries earlier
+                WHERE earlier.subscription_id = d.subscription_id
+                  AND earlier.seq < d.seq
+                  AND earlier.status IN ('pending', 'in_flight')
+          )
+        ORDER BY d.seq
+        LIMIT 1
+        FOR UPDATE OF d SKIP LOCKED
+        """,
+        now,
+    )
+
+
+async def _claim_lock_subscription(
+    conn: asyncpg.Connection, subscription_id: int
+) -> asyncpg.Record | None:
+    """锁定候选投递所属订阅行并返回其最新 active/paused（暂停边界权威检查）。
+
+    与 set_subscription_paused 的 UPDATE 行锁互斥：行锁等待期间暂停事务若先
+    提交，这里（READ COMMITTED）读到的就是新状态。
+    """
+    return await conn.fetchrow(
+        """
+        SELECT active, paused FROM subscriptions
+        WHERE id = $1
+        FOR UPDATE
+        """,
+        subscription_id,
+    )
+
+
+async def _claim_mark_in_flight(
+    conn: asyncpg.Connection,
+    *,
+    delivery_id: int,
+    now: datetime,
+    lease_expires: datetime,
+    lease_token: str,
+) -> asyncpg.Record:
+    return await conn.fetchrow(
+        """
+        UPDATE deliveries
+        SET status = 'in_flight',
+            leased_at = $2,
+            lease_expires_at = $3,
+            leased_by = $4,
+            updated_at = $2
+        WHERE id = $1
+        RETURNING id, event_id_fk, subscription_id, config_version_id,
+                  chain_id, chain_seq, attempts_made, status, not_before
+        """,
+        delivery_id,
+        now,
+        lease_expires,
+        lease_token,
+    )
+
+
 async def claim_delivery(
     conn: asyncpg.Connection, worker_id: str
 ) -> dict[str, Any] | None:
@@ -590,54 +744,22 @@ async def claim_delivery(
     lease_token = f"{worker_id}:{now.timestamp()}"
 
     async with conn.transaction():
-        # 候选：每个订阅 seq 最小的可处理投递（pending 到点 或 租约过期的 in_flight）。
-        # NOT EXISTS 保证严格顺序：前面还有未终结投递时不允许发送后续事件。
-        candidate = await conn.fetchrow(
-            """
-            SELECT d.id, d.event_id_fk, d.subscription_id, d.status,
-                   d.attempts_made, d.leased_by
-            FROM deliveries d
-            WHERE (
-                    (d.status = 'pending' AND d.not_before <= $1)
-                 OR (d.status = 'in_flight' AND d.lease_expires_at < $1)
-                )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM subscriptions s
-                    WHERE s.id = d.subscription_id AND s.active = FALSE
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM deliveries earlier
-                    WHERE earlier.subscription_id = d.subscription_id
-                      AND earlier.seq < d.seq
-                      AND earlier.status IN ('pending', 'in_flight')
-              )
-            ORDER BY d.seq
-            LIMIT 1
-            FOR UPDATE OF d SKIP LOCKED
-            """,
-            now,
-        )
+        candidate = await _claim_select_candidate(conn, now)
         if candidate is None:
             return None
 
-        updated = await conn.fetchrow(
-            """
-            UPDATE deliveries
-            SET status = 'in_flight',
-                leased_at = $2,
-                lease_expires_at = $3,
-                leased_by = $4,
-                updated_at = $2
-            WHERE id = $1
-            RETURNING id, event_id_fk, subscription_id, config_version_id,
-                      chain_id, chain_seq, attempts_made, status, not_before
-            """,
-            candidate["id"],
-            now,
-            lease_expires,
-            lease_token,
+        sub = await _claim_lock_subscription(conn, candidate["subscription_id"])
+        if sub is None or not sub["active"] or sub["paused"]:
+            # 暂停先于本事务提交（或订阅被停用）：放弃认领，事务回滚释放
+            # 投递行锁，不写入任何租约。
+            return None
+
+        updated = await _claim_mark_in_flight(
+            conn,
+            delivery_id=candidate["id"],
+            now=now,
+            lease_expires=lease_expires,
+            lease_token=lease_token,
         )
         if updated is None:
             return None

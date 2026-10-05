@@ -93,6 +93,20 @@ def _delivery_out(row: asyncpg.Record) -> DeliveryOut:
     )
 
 
+def _subscription_out(row: asyncpg.Record) -> SubscriptionOut:
+    return SubscriptionOut(
+        id=row["id"],
+        source=row["source"],
+        target_url=row["target_url"],
+        active=row["active"],
+        paused=row["paused"],
+        paused_at=row["paused_at"],
+        resumed_at=row["resumed_at"],
+        current_revision=row["current_revision"],
+        created_at=row["created_at"],
+    )
+
+
 # -- 事件 ----------------------------------------------------------------------
 
 # 提交状态机 owner 标识（仅用于恢复接管的可观测性）
@@ -243,14 +257,7 @@ async def create_subscription(body: SubscriptionCreate) -> SubscriptionOut:
                 else settings.backoff_cap_seconds
             ),
         )
-    return SubscriptionOut(
-        id=row["id"],
-        source=row["source"],
-        target_url=row["target_url"],
-        active=row["active"],
-        current_revision=row["current_revision"],
-        created_at=row["created_at"],
-    )
+    return _subscription_out(row)
 
 
 @router.get(
@@ -262,17 +269,7 @@ async def list_subscriptions(
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await repo.list_subscriptions(conn, source)
-    return [
-        SubscriptionOut(
-            id=r["id"],
-            source=r["source"],
-            target_url=r["target_url"],
-            active=r["active"],
-            current_revision=r["current_revision"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_subscription_out(r) for r in rows]
 
 
 @router.get(
@@ -286,14 +283,48 @@ async def get_subscription(subscription_id: int) -> SubscriptionOut:
         row = await repo.get_subscription_by_id(conn, subscription_id)
     if row is None:
         raise HTTPException(status_code=404, detail="订阅不存在")
-    return SubscriptionOut(
-        id=row["id"],
-        source=row["source"],
-        target_url=row["target_url"],
-        active=row["active"],
-        current_revision=row["current_revision"],
-        created_at=row["created_at"],
-    )
+    return _subscription_out(row)
+
+
+@router.post(
+    "/subscriptions/{subscription_id}/pause",
+    response_model=SubscriptionOut,
+    tags=["subscriptions"],
+)
+async def pause_subscription(subscription_id: int) -> SubscriptionOut:
+    """暂停订阅投递（幂等）。
+
+    成功返回后该订阅不会再产生新租约（状态写入与 Worker 认领提交经订阅行锁
+    串行）；暂停前已认领（in_flight）的尝试照常结算。暂停期间提交的事件仍
+    建立 pending 投递并钉住当时配置版本。重复暂停返回同一暂停状态（200）；
+    未知订阅返回 404。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row, _changed = await repo.set_subscription_paused(conn, subscription_id, True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return _subscription_out(row)
+
+
+@router.post(
+    "/subscriptions/{subscription_id}/resume",
+    response_model=SubscriptionOut,
+    tags=["subscriptions"],
+)
+async def resume_subscription(subscription_id: int) -> SubscriptionOut:
+    """恢复订阅投递（幂等）。
+
+    恢复不改任何投递记录：pending 投递沿原 seq、not_before（退避时刻）与
+    attempts_made（尝试次数）继续被认领；钉住的配置版本、严格顺序与死信重放
+    语义均不变。重复恢复返回同一状态（200）；未知订阅返回 404。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row, _changed = await repo.set_subscription_paused(conn, subscription_id, False)
+    if row is None:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return _subscription_out(row)
 
 
 # -- 订阅配置版本 / 无损切换 -----------------------------------------------------

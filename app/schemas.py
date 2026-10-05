@@ -41,6 +41,11 @@ class SubscriptionOut(BaseModel):
     source: str
     target_url: str
     active: bool
+    # 暂停状态（与 active 正交）：暂停只阻止新租约认领，事件仍建 pending 投递
+    paused: bool = False
+    # 最近一次暂停时刻；最近一次恢复时刻（暂停中 resumed_at 为 None）
+    paused_at: datetime | None = None
+    resumed_at: datetime | None = None
     current_revision: int
     created_at: datetime
 

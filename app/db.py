@@ -38,6 +38,17 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 # - created_at 即该版本成为当前版本（切换边界）的时刻；被新版本取代后由
 #   superseded_at 记录其边界结束时刻。
 #
+# 订阅暂停 / 恢复（paused，与 active 正交）：
+# - active=FALSE 表示订阅身份被停用（重新注册同 source+URL 即重新激活），事件提交
+#   不为其建立投递；paused=TRUE 是显式的“暂停投递”运维状态，只阻止 Worker 认领
+#   新租约，不阻止事件提交——暂停期间提交的事件照常建立 pending 投递并钉住当时的
+#   配置版本（故不能复用 active 标志实现暂停）；
+# - 暂停状态写入与 claim_delivery 的认领提交经 subscriptions 行锁形成先后次序：
+#   暂停事务提交后不可能再产生该订阅的新租约，暂停前已认领（in_flight）的尝试
+#   照常结算；恢复后沿原 seq / not_before / attempts_made 继续；
+# - paused_at 记录最近一次进入暂停的时刻，resumed_at 记录最近一次恢复的时刻
+#   （暂停中为 NULL），仅作状态展示。
+#
 # HMAC 密钥信封加密（见 app/envelope.py、app/keyring.py）：
 # - 新版本的密钥以随机 DEK 经 AES-256-GCM 加密（AAD 绑定 subscription_id +
 #   version_id），DEK 再由本地密钥环主密钥包裹；数据库只存
@@ -188,6 +199,11 @@ def _schema_statements(
             target_url       TEXT NOT NULL,
             secret           TEXT NOT NULL,
             active           BOOLEAN NOT NULL DEFAULT TRUE,
+            -- 暂停与 active 正交：暂停只阻止 Worker 认领新租约，不阻止事件提交
+            -- 建投递（暂停期间的投递仍钉住当时配置版本，见文件头说明）。
+            paused           BOOLEAN NOT NULL DEFAULT FALSE,
+            paused_at        TIMESTAMPTZ,
+            resumed_at       TIMESTAMPTZ,
             current_revision INTEGER NOT NULL DEFAULT 1,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
             UNIQUE (source, target_url)
@@ -196,6 +212,17 @@ def _schema_statements(
         # 旧库升级：补 current_revision 列（先可空，回填后再置 NOT NULL）
         """
         ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_revision INTEGER
+        """,
+        # 旧库升级：幂等补充暂停/恢复状态列（旧订阅默认未暂停）。
+        """
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paused BOOLEAN
+            NOT NULL DEFAULT FALSE
+        """,
+        """
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMPTZ
         """,
         """
         CREATE TABLE IF NOT EXISTS subscription_versions (
