@@ -19,6 +19,13 @@
   （revision 从 1 单调递增）。发布新版本必须携带 `expected_revision` 做 CAS；
   切换边界与发布事务原子确定——边界前创建的投递及其后续重试/接管始终用旧版本，
   边界后的投递用新版本；并发发布只有一个成功。详见下文[“配置版本与无损切换”](#配置版本与无损切换)。
+- **订阅投递暂停 / 恢复**：`POST /api/v1/subscriptions/{id}/pause`、`/resume`
+  可随时暂停/恢复某订阅的 Worker 投递。暂停是独立于启用标志（`active`）的
+  **认领闸门**：暂停成功后该订阅不再产生新租约（过期租约也不被接管），但
+  `POST /events` 仍为其建立 `pending` 投递并钉住当时配置版本；暂停前已认领
+  的在途尝试照常结算。恢复后沿原 `seq`、`not_before` 与尝试次数继续，重复
+  操作幂等，未知订阅 404，死信重放与严格顺序语义不变。详见下文
+  [“订阅暂停与恢复”](#订阅暂停与恢复)。
 - **严格顺序投递**：同一订阅（source → target）严格按事件顺序处理——前一事件
   成功或进入死信之前，后一事件不会被发送。
 - **租约抢占与接管**：Worker 从数据库认领任务并持有租约；Worker 宕机/卡死导致
@@ -75,9 +82,11 @@ MinIO 控制台：<http://localhost:9001>（默认凭据 `minioadmin / minioadmi
 
 1. 每个订阅的投递有一个全局单调的 `seq`；Worker 只认领该订阅 **seq 最小且未终结
    且前面不存在 pending/in_flight 投递** 的任务（`FOR UPDATE SKIP LOCKED`），
-   多 Worker 并发不会重复认领。
+   多 Worker 并发不会重复认领；订阅处于暂停（`paused=TRUE`）时整体不认领。
 2. 认领后状态为 `in_flight`，设置 `leased_by`（租约令牌）与
-   `lease_expires_at = now() + LEASE_SECONDS`。
+   `lease_expires_at = now() + LEASE_SECONDS`。认领事务在锁到投递行后还会
+   **锁住订阅行并复核暂停状态**，与暂停接口在同一行锁上串行（见
+   [“订阅暂停与恢复”](#订阅暂停与恢复)）。
 3. 投递完成后，记录尝试与结算都以租约令牌为条件；租约已被接管时本次结果作废。
 4. 成功 → `succeeded`；失败且未满 6 次 → 回到 `pending` 并设置指数退避时间
    `not_before`；满 6 次 → `dead_lettered`，其后同订阅的下一事件才允许发送。
@@ -179,8 +188,10 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | GET | `/events/{id}` | 查询事件 |
 | GET | `/events/{id}/deliveries` | 事件对应的所有投递 |
 | POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活；同时生成 revision=1） |
-| GET | `/subscriptions?source=` | 列出订阅（含 `current_revision`，不含密钥） |
-| GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision`，不含密钥） |
+| GET | `/subscriptions?source=` | 列出订阅（含 `current_revision` 与暂停状态 `paused/paused_at`，不含密钥） |
+| GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision` 与暂停状态，不含密钥） |
+| POST | `/subscriptions/{id}/pause` | 暂停投递（幂等；只关认领闸门，事件仍建 pending 投递；未知订阅 404） |
+| POST | `/subscriptions/{id}/resume` | 恢复投递（幂等；沿原 seq/not_before/尝试次数继续；未知订阅 404） |
 | POST | `/subscriptions/{id}/versions` | 发布新配置版本（CAS，必须带 `expected_revision`；201/409） |
 | GET | `/subscriptions/{id}/versions` | 列出全部配置版本与切换边界（不含密钥） |
 | GET | `/deliveries?status=&subscription_id=&source=&config_revision=` | 投递历史（含实际版本与边界） |
@@ -282,6 +293,123 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/7/replay \
 
 两种选择都随**新投递记录**固化（`config_version_id` 外键），之后该新记录的重试
 同样钉死所选版本。响应中 `config_revision` 即固化结果。
+
+## 订阅暂停与恢复
+
+需要临时停发某订阅（例如下游维护、紧急止血）而不想丢事件时，可暂停投递：
+
+```bash
+# 暂停：成功后该订阅不再被 Worker 认领（不产生新租约）
+curl -s -X POST localhost:8000/api/v1/subscriptions/1/pause | python3 -m json.tool
+# 查询：订阅视图含 paused / paused_at
+curl -s localhost:8000/api/v1/subscriptions/1 | python3 -m json.tool
+# 恢复：沿原 seq、not_before、attempts_made 继续
+curl -s -X POST localhost:8000/api/v1/subscriptions/1/resume | python3 -m json.tool
+```
+
+实际响应示例（与实现一致）：
+
+```json
+// POST /api/v1/subscriptions/1/pause  → 200
+{
+    "id": 1,
+    "source": "orders",
+    "target_url": "http://receiver:8001/receive",
+    "active": true,
+    "paused": true,
+    "paused_at": "2026-10-05T09:30:00.000000Z",
+    "current_revision": 1,
+    "created_at": "2026-10-05T09:00:00.000000Z"
+}
+```
+
+```json
+// GET /api/v1/subscriptions/1  → 200（暂停中）
+{
+    "id": 1,
+    "source": "orders",
+    "target_url": "http://receiver:8001/receive",
+    "active": true,
+    "paused": true,
+    "paused_at": "2026-10-05T09:30:00.000000Z",
+    "current_revision": 1,
+    "created_at": "2026-10-05T09:00:00.000000Z"
+}
+```
+
+```json
+// POST /api/v1/subscriptions/1/resume → 200
+{
+    "id": 1,
+    "source": "orders",
+    "target_url": "http://receiver:8001/receive",
+    "active": true,
+    "paused": false,
+    "paused_at": null,
+    "current_revision": 1,
+    "created_at": "2026-10-05T09:00:00.000000Z"
+}
+```
+
+对已暂停的订阅重复暂停、对投递中的订阅重复恢复都是幂等操作（仍返回 200 与
+当前状态）；未知订阅的暂停/恢复/查询均返回 `404`。`GET /subscriptions`
+列表中的每个订阅同样带有 `paused` 与 `paused_at` 字段。
+
+### 暂停期间的确切语义
+
+- **独立的认领闸门，不复用 `active`**：`subscriptions` 上 `active` 表示订阅是否
+  接收新事件（决定 `POST /events` 是否为其建投递，重复注册同 source+URL 会重新
+  激活）；`paused` 是另一个独立标志，**只关闭 Worker 认领**。因此暂停期间
+  `POST /api/v1/events` 照常为该订阅建立 `pending` 投递，并在创建那一刻钉住
+  当前配置版本（`config_version_id`）——恢复后这些投递直接续跑，不会丢事件。
+- **暂停边界与认领提交的事务先后**：暂停/恢复是对订阅行的加锁更新；Worker 的
+  `claim_delivery` 在同一事务内先 `FOR UPDATE SKIP LOCKED` 锁到候选投递行，再
+  **`FOR UPDATE` 锁住其订阅行并在锁内复核 `paused`**，然后才写入租约。状态检查
+  与认领提交因此原子绑定：
+  - 暂停事务**先提交**：并发认领在订阅行锁上等待后读到的是 `paused=TRUE` 的
+    最新版本，放弃认领（事务回滚，不写任何租约）——不会出现“读到旧状态的认领
+    越过边界”；
+  - 认领事务**先提交**：暂停必须等认领完成，该笔租约已经成立——**暂停前已认领
+    的在途尝试照常投递并结算**（成功/失败/退避/死信都正常）。暂停只阻断此后的
+    新租约；暂停期间过期的租约也不会被接管。
+  锁序恒为“先投递行、后订阅行”，与版本发布、事件提交（只锁订阅行）不会形成
+  死锁环。
+- **恢复不重置任何投递状态**：`seq`、`not_before`（退避到点时间）、
+  `attempts_made`（已尝试次数）与每条投递钉住的配置版本全部原样保留，Worker
+  恢复后从队首继续，严格顺序与指数退避语义不变。
+- **配置版本与死信重放不受影响**：暂停期间可以正常 `POST /versions` 发布新版本
+  （边界前已建的投递仍钉旧版本，恢复后新建的投递用新版本）；暂停期间死信重放
+  仍会在同一 `chain_id` 上新建 `chain_seq+1` 的 `pending` 投递记录，恢复后被
+  认领。
+
+### 快速体验（Docker Compose 一键启动）
+
+```bash
+docker compose up --build          # db + minio + api + worker + receiver
+```
+
+```bash
+# 1) 注册订阅并提交一个事件（投递成功）
+curl -s -X POST localhost:8000/api/v1/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","target_url":"http://receiver:8001/receive",
+       "secret":"dev-signing-secret"}'
+
+# 2) 暂停订阅
+curl -i -X POST localhost:8000/api/v1/subscriptions/1/pause
+
+# 3) 暂停期间提交事件：仍返回 201、建立 pending 投递（钉住当前 revision），
+#    但 worker 不会发送——接收器 /received 中看不到它
+curl -i -X POST localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"evt-paused-1","payload":{"hello":"pause"}}'
+curl -s 'localhost:8000/api/v1/deliveries?source=orders' | python3 -m json.tool
+#   "status": "pending", "attempts_made": 0, "leased_by": null
+
+# 4) 恢复：pending 投递立即按原 seq 续跑成功，接收器随即收到
+curl -i -X POST localhost:8000/api/v1/subscriptions/1/resume
+curl -s localhost:8001/received | python3 -m json.tool
+```
 
 ### 注册时指定初始版本重试参数
 
@@ -966,8 +1094,10 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 - `payload_gc_candidates` / `payload_gc_runs`：GC 的零引用候选（带首次见
   时间戳，实现宽限期）与回收运行审计记录。
 - `subscriptions`：订阅身份（source、启用状态、`current_revision`）。
-  `target_url` 列随当前版本冗余同步；`secret` 冗余列不再保存明文（统一置空），
-  权威配置在版本表。
+  `active` 表示是否为新事件建投递（同 source+URL 重新注册会重新激活）；
+  独立的 `paused`/`paused_at` 是**暂停投递闸门**——只阻止 Worker 认领，不阻止
+  建投递（暂停期间事件仍建立 pending 投递）。`target_url` 列随当前版本冗余同步；
+  `secret` 冗余列不再保存明文（统一置空），权威配置在版本表。
 - `subscription_versions`：不可变配置版本，`(subscription_id, revision)` 唯一。
   保存 `target_url`、重试参数与密钥的**信封加密列**（`secret_ciphertext`、
   `secret_dek_wrapped`、`secret_key_id`）；`secret` 明文列仅用于迁移前的旧
@@ -1043,3 +1173,10 @@ python -m app.payloadadmin gc --rescan-store
   时绝不谎报 completed，回滚行在重跑中可回访并迁完，重复运行不重复计数/不
   新增引用，旧库残留的“completed 但仍有旧行”状态自动重开补迁。
 - `test_gc_concurrency.py`：GC 与并发提交/恢复/迁移的引用互斥专项。
+- `test_pause_resume.py`：订阅暂停/恢复专项——HTTP 暂停/查询/恢复、重复操作
+  幂等、未知订阅 404、订阅视图含暂停状态；暂停后不产生新租约（过期租约也不
+  接管）、暂停前已认领的在途尝试照常结算（`/slow` 确定性验证）；暂停期间事件
+  仍建 pending 投递并钉住当时版本、恢复后沿原 seq/not_before/尝试次数继续；
+  暂停期间发布新版本的版本固定、暂停期间死信重放语义不变；并在仓库层直接验证
+  暂停写入与 `claim_delivery` 的行锁串行边界（暂停先提交则认领放弃、认领先
+  提交则在途租约有效，无读到旧状态的跨界认领）。

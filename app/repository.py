@@ -106,7 +106,8 @@ async def create_subscription(
             VALUES ($1, $2, '', 1)
             ON CONFLICT (source, target_url) DO UPDATE
                 SET active = TRUE
-            RETURNING id, source, target_url, active, created_at, current_revision,
+            RETURNING id, source, target_url, active, paused, paused_at,
+                      created_at, current_revision,
                       (xmax = 0) AS inserted
             """,
             source,
@@ -139,7 +140,8 @@ async def get_subscription_by_id(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, target_url, active, current_revision, created_at
+        SELECT id, source, target_url, active, paused, paused_at,
+               current_revision, created_at
         FROM subscriptions WHERE id = $1
         """,
         subscription_id,
@@ -151,7 +153,8 @@ async def find_subscription(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, target_url, active, current_revision, created_at
+        SELECT id, source, target_url, active, paused, paused_at,
+               current_revision, created_at
         FROM subscriptions WHERE source = $1 AND target_url = $2
         """,
         source,
@@ -165,7 +168,8 @@ async def list_subscriptions(
     if source is not None:
         rows = await conn.fetch(
             """
-            SELECT id, source, target_url, active, current_revision, created_at
+            SELECT id, source, target_url, active, paused, paused_at,
+                   current_revision, created_at
             FROM subscriptions WHERE source = $1 ORDER BY id
             """,
             source,
@@ -173,11 +177,56 @@ async def list_subscriptions(
     else:
         rows = await conn.fetch(
             """
-            SELECT id, source, target_url, active, current_revision, created_at
+            SELECT id, source, target_url, active, paused, paused_at,
+                   current_revision, created_at
             FROM subscriptions ORDER BY id
             """
         )
     return list(rows)
+
+
+async def set_subscription_paused(
+    conn: asyncpg.Connection, subscription_id: int, paused: bool
+) -> asyncpg.Record | None:
+    """暂停或恢复订阅投递（幂等），返回更新后的订阅行；未知订阅返回 None。
+
+    暂停（paused=TRUE）/恢复（paused=FALSE）是对订阅行的一次加锁更新，与
+    Worker 的 claim_delivery 在**同一行锁**上串行，从而确定认领边界：
+
+    - 暂停事务提交成功后才返回 200；此时任何后于暂停提交的认领事务在锁上
+      等待后都会读到 paused=TRUE 并放弃认领，因此暂停响应成功后不会再产生
+      该订阅的新租约；
+    - 先于暂停提交的认领（已持有行锁并完成租约写入）不受影响，暂停前已
+      认领的尝试照常结算；
+    - 恢复只清除闸门：投递记录的 seq/not_before/attempts_made 全部原样保留，
+      Worker 沿原顺序、原退避时刻、原尝试次数继续。
+
+    重复调用幂等：重复暂停只刷新 paused_at，恢复将其清空；不触碰 active 与
+    任何配置版本，暂停期间事件提交仍按 active 建立 pending 投递。
+    """
+    if paused:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+            SET paused = TRUE, paused_at = now()
+            WHERE id = $1
+            RETURNING id, source, target_url, active, paused, paused_at,
+                      current_revision, created_at
+            """,
+            subscription_id,
+        )
+    else:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+            SET paused = FALSE, paused_at = NULL
+            WHERE id = $1
+            RETURNING id, source, target_url, active, paused, paused_at,
+                      current_revision, created_at
+            """,
+            subscription_id,
+        )
+    return row
 
 
 # -- 订阅配置版本 / CAS 发布 ----------------------------------------------------
@@ -534,6 +583,10 @@ async def finalize_event_submission(
         )
 
         # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+        # 注意只按 active 过滤、绝不加 paused 条件：暂停（s.paused=TRUE）只关闭
+        # Worker 的认领闸门，不阻止建投递——暂停期间提交的事件必须照常建立
+        # pending 投递并在此刻钉住当前配置版本，恢复后沿原 seq 继续（不复用
+        # active 这个“是否建投递”的标志来实现暂停）。
         await conn.execute(
             """
             SELECT id FROM subscriptions
@@ -581,6 +634,17 @@ async def get_event(
 # 2) 检查它前面是否还有未终结的投递，有则跳过（保证前一事件成功或进死信后才动）；
 # 3) 用 lease_token 栅栏把它置为 in_flight，旧租约必须已过期才可接管。
 # 认领/重试/接管一律不改变 config_version_id：投递钉死在创建时的版本上。
+#
+# 暂停边界（paused）的同步：
+# 暂停（set_subscription_paused）与认领在本事务内对**同一订阅行加 FOR UPDATE
+# 行锁**串行，状态检查与认领提交原子绑定，杜绝“读到旧状态的认领越过边界”：
+#   - 候选查询里的 NOT EXISTS(s.paused) 只是免锁预过滤（READ COMMITTED 下每条
+#     语句各自取快照，不能单独作为边界保证）；
+#   - 锁到候选投递后必须再锁其订阅行并在锁内复核 paused：若暂停事务已先提交，
+#     本次等待拿到的是 paused=TRUE 的最新版本，放弃认领（不产生新租约）；
+#   - 若本次先持锁，暂停事务只能等到认领提交（租约已写）后继续，因此该笔
+#     “暂停前已认领”的尝试照常投递并结算——暂停只阻断新租约，不取消在途投递。
+# 锁序恒为“先投递行、后订阅行”，与版本发布/事件提交（只锁订阅行）不会成环。
 async def claim_delivery(
     conn: asyncpg.Connection, worker_id: str
 ) -> dict[str, Any] | None:
@@ -592,6 +656,8 @@ async def claim_delivery(
     async with conn.transaction():
         # 候选：每个订阅 seq 最小的可处理投递（pending 到点 或 租约过期的 in_flight）。
         # NOT EXISTS 保证严格顺序：前面还有未终结投递时不允许发送后续事件。
+        # s.active=FALSE（停用，不接收新事件的旧订阅）与 s.paused=TRUE（暂停投递
+        # 闸门）的订阅在此预过滤排除；paused 的权威复核在锁到订阅行之后进行。
         candidate = await conn.fetchrow(
             """
             SELECT d.id, d.event_id_fk, d.subscription_id, d.status,
@@ -604,7 +670,8 @@ async def claim_delivery(
               AND NOT EXISTS (
                     SELECT 1
                     FROM subscriptions s
-                    WHERE s.id = d.subscription_id AND s.active = FALSE
+                    WHERE s.id = d.subscription_id
+                      AND (s.active = FALSE OR s.paused = TRUE)
               )
               AND NOT EXISTS (
                     SELECT 1
@@ -620,6 +687,22 @@ async def claim_delivery(
             now,
         )
         if candidate is None:
+            return None
+
+        # 边界同步：锁候选所属订阅行（与暂停/恢复/版本发布互斥），在锁内复核
+        # 暂停状态。此处 FOR UPDATE 会等到并发暂停事务提交/回滚后返回其最新
+        # 已提交版本：暂停已生效则放弃本候选（本轮回滚，不写租约），从而保证
+        # “暂停响应成功后不再产生新租约”。暂停期间过期租约同样不可接管。
+        sub = await conn.fetchrow(
+            """
+            SELECT active, paused
+            FROM subscriptions
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            candidate["subscription_id"],
+        )
+        if sub is None or not sub["active"] or sub["paused"]:
             return None
 
         updated = await conn.fetchrow(

@@ -30,7 +30,9 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     )
 
 # 订阅配置版本化（无损切换）：
-# - subscriptions 保留身份（id/source）与启用状态，current_revision 指向当前版本；
+# - subscriptions 保留身份（id/source）与启用状态（active：是否为新事件建投递）、
+#   暂停状态（paused/paused_at：暂停仅关闭 Worker 认领闸门，不影响新事件建投递）
+#   与 current_revision（指向当前版本）；
 # - subscription_versions 不可变保存每个版本的 target_url / HMAC 密钥 / 重试参数，
 #   revision 从 1 起单调递增；发布新版本只追加，不改旧版本；
 # - deliveries.config_version_id 固化该投递实际使用的版本：边界前创建的投递
@@ -192,6 +194,18 @@ def _schema_statements(
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
             UNIQUE (source, target_url)
         )
+        """,
+        # 订阅投递暂停/恢复（旧库升级幂等补充）：
+        # paused 是独立于 active 的“投递闸门”——active 表示订阅是否接收新事件
+        # （决定事件提交是否建投递），paused 仅决定 Worker 是否还可认领该订阅的
+        # 投递。暂停期间事件照常建 pending 投递（钉住当时配置版本），恢复后续跑；
+        # 不允许复用 active 实现暂停，否则暂停期间的事件将永远没有投递。
+        # paused_at 仅记录最近一次暂停时刻，恢复时清空。
+        """
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE
+        """,
+        """
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ
         """,
         # 旧库升级：补 current_revision 列（先可空，回填后再置 NOT NULL）
         """

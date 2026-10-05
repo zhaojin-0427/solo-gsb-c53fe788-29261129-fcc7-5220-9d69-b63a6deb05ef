@@ -40,7 +40,12 @@ class SubscriptionOut(BaseModel):
     id: int
     source: str
     target_url: str
+    # active：订阅是否接收新事件（事件提交是否为其建投递）
     active: bool
+    # paused：投递是否被临时暂停（只关闭 Worker 认领闸门；暂停期间事件照常
+    # 建立 pending 投递并钉住当时配置版本，恢复后沿原 seq/not_before/尝试次数继续）
+    paused: bool = False
+    paused_at: datetime | None = None
     current_revision: int
     created_at: datetime
 
